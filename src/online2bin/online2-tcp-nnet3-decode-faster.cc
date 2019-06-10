@@ -257,7 +257,7 @@ std::string LatticeToJson(const Lattice &lat,
                           const ConstArpaLm &carpa) {
   Lattice tmp_lat(lat), composed_lat;
 
-  CompactLattice determinized_lat, composed_clat, res_lat;
+  CompactLattice determinized_lat, composed_clat, res_clat;
 
   fst::ScaleLattice(fst::GraphLatticeScale(-1.0), &tmp_lat);
   ArcSort(&tmp_lat, fst::OLabelCompare<LatticeArc>());
@@ -278,15 +278,15 @@ std::string LatticeToJson(const Lattice &lat,
   ComposeCompactLatticeDeterministic(determinized_lat, &const_arpa_fst, &composed_clat);
   ConvertLattice(composed_clat, &composed_lat);
   Invert(&composed_lat);
-  DeterminizeLattice(composed_lat, &res_lat);
-  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &res_lat);
+  DeterminizeLattice(composed_lat, &res_clat);
+  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &res_clat);
 
-  if (res_lat.Start() == fst::kNoStateId) {
+  if (res_clat.Start() == fst::kNoStateId) {
     KALDI_WARN << "Empty lattice (incompatible LM?)";
     return "";
   }
 
-  return LatticeToJson(res_lat, word_syms, word_boundary, trans_model,
+  return LatticeToJson(res_clat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final);
 }
 
@@ -306,10 +306,10 @@ std::string LatticeToJson(const CompactLattice &clat,
     return "";
   }
 
-  Lattice best_path_lat;
-  ConvertLattice(clat, &best_path_lat);
+  Lattice lat;
+  ConvertLattice(clat, &lat);
 
-  return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
+  return LatticeToJson(lat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final,
                        lm_fst, lm_compose_cache, carpa);
 }
