@@ -93,7 +93,8 @@ std::string LatticeToJson(const Lattice &lat,
                           const OnlineNnet2FeaturePipelineInfo &feature_info,
                           const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
                           int32 frame_offset,
-                          bool final) {
+                          bool final,
+                          std::vector<BaseFloat> confidences = std::vector<BaseFloat>()) {
   LatticeWeight weight;
   std::vector<int32> alignment;
   std::vector<int32> words;
@@ -127,13 +128,15 @@ std::string LatticeToJson(const Lattice &lat,
   ConvertLattice(lat, &clat);
   CompactLattice aligned_clat;
 
-  // Get confidences
-  MinimumBayesRiskOptions mbr_opts;
-  mbr_opts.decode_mbr = false; // we just want confidences
-  mbr_opts.print_silence = false; 
-  MinimumBayesRisk *mbr = new MinimumBayesRisk(clat, words, mbr_opts);
-  std::vector<BaseFloat> confidences = mbr->GetOneBestConfidences();
-  delete mbr;
+  if (confidences.empty()) {
+    // Get confidences
+    MinimumBayesRiskOptions mbr_opts;
+    mbr_opts.decode_mbr = false; // we just want confidences
+    mbr_opts.print_silence = false;
+    MinimumBayesRisk *mbr = new MinimumBayesRisk(clat, words, mbr_opts);
+    confidences = mbr->GetOneBestConfidences();
+    delete mbr;
+  }
 
   // Word-align the lattice (can be phone-aligned too if needed)
   if (!WordAlignLattice(clat, trans_model, word_boundary, 0, &aligned_clat)) {
@@ -224,13 +227,21 @@ std::string LatticeToJson(const CompactLattice &clat,
     return "";
   }
 
+  // Get confidences
+  MinimumBayesRiskOptions mbr_opts;
+  mbr_opts.decode_mbr = false; // we just want confidences
+  mbr_opts.print_silence = false;
+  MinimumBayesRisk *mbr = new MinimumBayesRisk(clat, mbr_opts);
+  std::vector<BaseFloat> confidences = mbr->GetOneBestConfidences();
+  delete mbr;
+
   CompactLattice best_path_clat;
   CompactLatticeShortestPath(clat, &best_path_clat);
 
   Lattice best_path_lat;
   ConvertLattice(best_path_clat, &best_path_lat);
   return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
-                       feature_info, decodable_opts, frame_offset, final);
+                       feature_info, decodable_opts, frame_offset, final, confidences);
 }
 
 std::string LatticeToJson(const Lattice &lat, 
@@ -295,11 +306,9 @@ std::string LatticeToJson(const CompactLattice &clat,
     return "";
   }
 
-  CompactLattice best_path_clat;
-  CompactLatticeShortestPath(clat, &best_path_clat);
-
   Lattice best_path_lat;
-  ConvertLattice(best_path_clat, &best_path_lat);
+  ConvertLattice(clat, &best_path_lat);
+
   return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final,
                        lm_fst, lm_compose_cache, carpa);
