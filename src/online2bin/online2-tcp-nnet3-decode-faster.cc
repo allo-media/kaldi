@@ -31,6 +31,7 @@
 #include "nnet3/nnet-utils.h"
 #include "lat/word-align-lattice.h"
 #include "lat/sausages.h"
+#include "lm/const-arpa-lm.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -84,37 +85,6 @@ struct _WordAlignmentInfo {
   int32 length_in_frames;
   double confidence;
 };
-
-std::string LatticeToString(const Lattice &lat, const fst::SymbolTable &word_syms) {
-  LatticeWeight weight;
-  std::vector<int32> alignment;
-  std::vector<int32> words;
-  GetLinearSymbolSequence(lat, &alignment, &words, &weight);
-
-  std::ostringstream msg;
-  for (size_t i = 0; i < words.size(); i++) {
-    std::string s = word_syms.Find(words[i]);
-    if (s.empty()) {
-      KALDI_WARN << "Word-id " << words[i] << " not in symbol table.";
-      msg << "<#" << std::to_string(i) << "> ";
-    } else
-      msg << s << " ";
-  }
-  return msg.str();
-}
-
-std::string LatticeToString(const CompactLattice &clat, const fst::SymbolTable &word_syms) {
-  if (clat.NumStates() == 0) {
-    KALDI_WARN << "Empty lattice.";
-    return "";
-  }
-  CompactLattice best_path_clat;
-  CompactLatticeShortestPath(clat, &best_path_clat);
-
-  Lattice best_path_lat;
-  ConvertLattice(best_path_clat, &best_path_lat);
-  return LatticeToString(best_path_lat, word_syms);
-}
 
 std::string LatticeToJson(const Lattice &lat, 
                           const fst::SymbolTable &word_syms,
@@ -262,6 +232,78 @@ std::string LatticeToJson(const CompactLattice &clat,
   return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final);
 }
+
+std::string LatticeToJson(const Lattice &lat, 
+                          const fst::SymbolTable &word_syms,
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
+                          fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
+                          const ConstArpaLm &carpa) {
+  Lattice tmp_lat(lat), composed_lat;
+
+  CompactLattice determinized_lat, composed_clat, res_lat;
+
+  fst::ScaleLattice(fst::GraphLatticeScale(-1.0), &tmp_lat);
+  ArcSort(&tmp_lat, fst::OLabelCompare<LatticeArc>());
+  TableCompose(tmp_lat, lm_fst, &composed_lat, &lm_compose_cache);
+  Invert(&composed_lat); // make it so word labels are on the input.
+  DeterminizeLattice(composed_lat, &determinized_lat);
+  fst::ScaleLattice(fst::GraphLatticeScale(-1.0), &determinized_lat);
+
+  if (determinized_lat.Start() == fst::kNoStateId) {
+    KALDI_WARN << "Empty lattice (incompatible LM?)";
+    return "";
+  } 
+  
+  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &determinized_lat);
+  ArcSort(&determinized_lat, fst::OLabelCompare<CompactLatticeArc>());
+
+  ConstArpaLmDeterministicFst const_arpa_fst(carpa);
+  ComposeCompactLatticeDeterministic(determinized_lat, &const_arpa_fst, &composed_clat);
+  ConvertLattice(composed_clat, &composed_lat);
+  Invert(&composed_lat);
+  DeterminizeLattice(composed_lat, &res_lat);
+  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &res_lat);
+
+  if (res_lat.Start() == fst::kNoStateId) {
+    KALDI_WARN << "Empty lattice (incompatible LM?)";
+    return "";
+  }
+
+  return LatticeToJson(res_lat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final);
+}
+
+std::string LatticeToJson(const CompactLattice &clat, 
+                          const fst::SymbolTable &word_syms, 
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
+                          fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
+                          const ConstArpaLm &carpa) {
+  if (clat.NumStates() == 0) {
+    KALDI_WARN << "Empty lattice.";
+    return "";
+  }
+
+  CompactLattice best_path_clat;
+  CompactLatticeShortestPath(clat, &best_path_clat);
+
+  Lattice best_path_lat;
+  ConvertLattice(best_path_clat, &best_path_lat);
+  return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final,
+                       lm_fst, lm_compose_cache, carpa);
+}
 }
 
 int main(int argc, char *argv[]) {
@@ -296,6 +338,8 @@ int main(int argc, char *argv[]) {
     BaseFloat samp_freq = 16000.0;
     int port_num = 5050;
     int read_timeout = 3;
+    bool rescore = false;
+    int lmwt = 10;
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -309,6 +353,10 @@ int main(int argc, char *argv[]) {
                 "Number of seconds of timout for TCP audio data to appear on the stream. Use -1 for blocking.");
     po.Register("port-num", &port_num,
                 "Port number the server will listen on.");
+    po.Register("rescore", &rescore,
+                "Do we want to rescore lattices with bigger LM?");
+    po.Register("lmwt", &lmwt,
+                "Rescoring LM weight.");
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
@@ -327,6 +375,8 @@ int main(int argc, char *argv[]) {
     std::string fst_rxfilename = model_dir + "/HCLG.fst.map";
     std::string word_syms_filename = model_dir + "/words.txt";
     std::string word_boundary_filename = model_dir + "/phones/word_boundary.int";
+    std::string g_fst_filename = model_dir + "/G.fst.proj.sort";
+    std::string g_carpa_filename = model_dir + "/G.carpa";
 
     OnlineNnet2FeaturePipelineInfo feature_info(feature_opts);
 
@@ -362,6 +412,30 @@ int main(int argc, char *argv[]) {
 
     WordBoundaryInfoNewOpts opts;
     WordBoundaryInfo *word_boundary = new WordBoundaryInfo(opts, word_boundary_filename);
+
+    KALDI_VLOG(1) << "Loading G.fst...";
+
+    fst::VectorFst<fst::StdArc> *lm_fst = fst::VectorFst<fst::StdArc>::Read(g_fst_filename);
+    if (lm_fst->Properties(fst::kILabelSorted, true) == 0) {
+      // Make sure LM is sorted on ilabel.
+      fst::ILabelCompare<fst::StdArc> ilabel_comp;
+      fst::ArcSort(lm_fst, ilabel_comp);
+    }
+    int32 num_states_cache = 50000;
+    fst::CacheOptions cache_opts(true, num_states_cache);
+    fst::MapFstOptions mapfst_opts(cache_opts);
+    fst::StdToLatticeMapper<BaseFloat> mapper;
+    fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > g_fst(*lm_fst, mapper, mapfst_opts);
+    delete lm_fst;
+    fst::TableComposeOptions compose_opts(fst::TableMatcherOptions(),
+                                          true, fst::SEQUENCE_FILTER,
+                                          fst::MATCH_INPUT);
+    fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache(compose_opts);
+
+    KALDI_VLOG(1) << "Loading G.carpa...";
+
+    ConstArpaLm carpa;
+    ReadKaldiObject(g_carpa_filename, &carpa);
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE to avoid crashing when socket forcefully disconnected
 
@@ -407,8 +481,14 @@ int main(int argc, char *argv[]) {
             if (decoder.NumFramesDecoded() > 0) {
               CompactLattice lat;
               decoder.GetLattice(true, &lat);
-              std::string msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
-                                              feature_info, decodable_opts, frame_offset, true);
+              std::string msg;
+              if (rescore)
+                msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                                    feature_info, decodable_opts, frame_offset, true,
+                                    g_fst, lm_compose_cache, carpa);
+              else
+                msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                                    feature_info, decodable_opts, frame_offset, true);
               if (msg.size() > 0)
                 server.WriteLn(msg);
             } else
@@ -436,9 +516,10 @@ int main(int argc, char *argv[]) {
             if (decoder.NumFramesDecoded() > 0) {
               Lattice lat;
               decoder.GetBestPath(false, &lat);
-              std::string msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
-                                              feature_info, decodable_opts, 
-                                              frame_offset + decoder.NumFramesDecoded(), false);
+              std::string msg;
+              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, 
+                                  frame_offset + decoder.NumFramesDecoded(), false);
               if (msg.size() > 0)
                 server.WriteLn(msg);
             }
@@ -450,8 +531,14 @@ int main(int argc, char *argv[]) {
             frame_offset += decoder.NumFramesDecoded();
             CompactLattice lat;
             decoder.GetLattice(true, &lat);
-            std::string msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
-                                              feature_info, decodable_opts, frame_offset, true);
+            std::string msg;
+            if (rescore)
+              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, frame_offset, true,
+                                  g_fst, lm_compose_cache, carpa);
+            else
+              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, frame_offset, true);
             if (msg.size() > 0)
               server.WriteLn(msg);
             break;
