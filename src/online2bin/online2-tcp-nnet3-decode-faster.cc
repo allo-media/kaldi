@@ -114,7 +114,7 @@ std::string LatticeToJson(const Lattice &lat,
   }
   std::string transcript = tr.str();
   size_t end = transcript.find_last_not_of(" \n\r\t\f\v");
-	transcript = (end == std::string::npos) ? "" : transcript.substr(0, end + 1);
+  transcript = (end == std::string::npos) ? "" : transcript.substr(0, end + 1);
 
   // Break here if we have no words, this skips the segment totally
   if (transcript.empty())
