@@ -254,7 +254,8 @@ std::string LatticeToJson(const Lattice &lat,
                           bool final,
                           const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
                           fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
-                          const ConstArpaLm &carpa) {
+                          const ConstArpaLm &carpa,
+                          BaseFloat lmwt) {
   Lattice tmp_lat(lat), composed_lat;
 
   CompactLattice determinized_lat, composed_clat, res_clat;
@@ -286,6 +287,16 @@ std::string LatticeToJson(const Lattice &lat,
     return "";
   }
 
+  BaseFloat acoustic_scale = 1.0 / lmwt;
+  fst::ScaleLattice(fst::AcousticLatticeScale(acoustic_scale), &res_clat);
+
+  if (!PruneLattice(5.0, &res_clat)) {
+    KALDI_WARN << "Error pruning lattice";
+    return "";
+  }
+
+  fst::ScaleLattice(fst::AcousticLatticeScale(1.0/acoustic_scale), &res_clat);
+
   return LatticeToJson(res_clat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final);
 }
@@ -300,7 +311,8 @@ std::string LatticeToJson(const CompactLattice &clat,
                           bool final,
                           const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
                           fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
-                          const ConstArpaLm &carpa) {
+                          const ConstArpaLm &carpa,
+                          BaseFloat lmwt) {
   if (clat.NumStates() == 0) {
     KALDI_WARN << "Empty lattice.";
     return "";
@@ -311,7 +323,7 @@ std::string LatticeToJson(const CompactLattice &clat,
 
   return LatticeToJson(lat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final,
-                       lm_fst, lm_compose_cache, carpa);
+                       lm_fst, lm_compose_cache, carpa, lmwt);
 }
 }
 
@@ -494,7 +506,7 @@ int main(int argc, char *argv[]) {
               if (rescore)
                 msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
                                     feature_info, decodable_opts, frame_offset, true,
-                                    g_fst, lm_compose_cache, carpa);
+                                    g_fst, lm_compose_cache, carpa, lmwt);
               else
                 msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
                                     feature_info, decodable_opts, frame_offset, true);
@@ -544,7 +556,7 @@ int main(int argc, char *argv[]) {
             if (rescore)
               msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
                                   feature_info, decodable_opts, frame_offset, true,
-                                  g_fst, lm_compose_cache, carpa);
+                                  g_fst, lm_compose_cache, carpa, lmwt);
             else
               msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
                                   feature_info, decodable_opts, frame_offset, true);
