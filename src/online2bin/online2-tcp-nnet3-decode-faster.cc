@@ -287,16 +287,18 @@ std::string LatticeToJson(const Lattice &lat,
     return "";
   }
 
-  BaseFloat acoustic_scale = 1.0 / lmwt;
-  fst::ScaleLattice(fst::AcousticLatticeScale(acoustic_scale), &res_clat);
+  if (lmwt != 1.0) {
+    BaseFloat acoustic_scale = 1.0 / lmwt;
+    fst::ScaleLattice(fst::AcousticLatticeScale(acoustic_scale), &res_clat);
 
-  if (!PruneLattice(5.0, &res_clat)) {
-    KALDI_WARN << "Error pruning lattice";
-    return "";
+    if (!PruneLattice(5.0, &res_clat)) {
+      KALDI_WARN << "Error pruning lattice";
+      return "";
+    }
+
+    fst::ScaleLattice(fst::AcousticLatticeScale(1.0/acoustic_scale), &res_clat);
   }
-
-  fst::ScaleLattice(fst::AcousticLatticeScale(1.0/acoustic_scale), &res_clat);
-
+  
   return LatticeToJson(res_clat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final);
 }
@@ -360,7 +362,7 @@ int main(int argc, char *argv[]) {
     int port_num = 5050;
     int read_timeout = 3;
     bool rescore = false;
-    int lmwt = 10;
+    BaseFloat lmwt = 1.0;
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
