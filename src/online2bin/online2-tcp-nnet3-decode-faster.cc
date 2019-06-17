@@ -86,7 +86,7 @@ struct _WordAlignmentInfo {
   double confidence;
 };
 
-std::string LatticeToJson(const Lattice &lat, 
+std::string LatticeToOutput(const Lattice &lat,
                           const fst::SymbolTable &word_syms,
                           const WordBoundaryInfo &word_boundary,
                           const TransitionModel &trans_model,
@@ -94,6 +94,7 @@ std::string LatticeToJson(const Lattice &lat,
                           const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
                           int32 frame_offset,
                           bool final,
+                          std::string output,
                           std::vector<BaseFloat> confidences = std::vector<BaseFloat>()) {
   LatticeWeight weight;
   std::vector<int32> alignment;
@@ -120,6 +121,10 @@ std::string LatticeToJson(const Lattice &lat,
   // Break here if we have no words, this skips the segment totally
   if (transcript.empty())
     return "";
+
+  if (output == "text") {
+    return transcript;
+  }
 
   BaseFloat likelihood = -(weight.Value1() + weight.Value2());
   int num_frames = alignment.size();
@@ -214,14 +219,15 @@ std::string LatticeToJson(const Lattice &lat,
   return json;
 }
 
-std::string LatticeToJson(const CompactLattice &clat, 
+std::string LatticeToOutput(const CompactLattice &clat,
                           const fst::SymbolTable &word_syms, 
                           const WordBoundaryInfo &word_boundary,
                           const TransitionModel &trans_model,
                           const OnlineNnet2FeaturePipelineInfo &feature_info,
                           const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
                           int32 frame_offset,
-                          bool final) {
+                          bool final,
+                          std::string output) {
   if (clat.NumStates() == 0) {
     KALDI_WARN << "Empty lattice.";
     return "";
@@ -240,11 +246,11 @@ std::string LatticeToJson(const CompactLattice &clat,
 
   Lattice best_path_lat;
   ConvertLattice(best_path_clat, &best_path_lat);
-  return LatticeToJson(best_path_lat, word_syms, word_boundary, trans_model,
-                       feature_info, decodable_opts, frame_offset, final, confidences);
+  return LatticeToOutput(best_path_lat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final, output, confidences);
 }
 
-std::string LatticeToJson(const Lattice &lat, 
+std::string LatticeToOutput(const Lattice &lat,
                           const fst::SymbolTable &word_syms,
                           const WordBoundaryInfo &word_boundary,
                           const TransitionModel &trans_model,
@@ -255,7 +261,8 @@ std::string LatticeToJson(const Lattice &lat,
                           const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
                           fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
                           const ConstArpaLm &carpa,
-                          BaseFloat lmwt) {
+                          BaseFloat lmwt,
+                          std::string output) {
   Lattice tmp_lat(lat), composed_lat;
 
   CompactLattice determinized_lat, composed_clat, res_clat;
@@ -298,12 +305,12 @@ std::string LatticeToJson(const Lattice &lat,
 
     fst::ScaleLattice(fst::AcousticLatticeScale(1.0/acoustic_scale), &res_clat);
   }
-  
-  return LatticeToJson(res_clat, word_syms, word_boundary, trans_model,
-                       feature_info, decodable_opts, frame_offset, final);
+
+  return LatticeToOutput(res_clat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final, output);
 }
 
-std::string LatticeToJson(const CompactLattice &clat, 
+std::string LatticeToOutput(const CompactLattice &clat,
                           const fst::SymbolTable &word_syms, 
                           const WordBoundaryInfo &word_boundary,
                           const TransitionModel &trans_model,
@@ -314,7 +321,8 @@ std::string LatticeToJson(const CompactLattice &clat,
                           const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
                           fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
                           const ConstArpaLm &carpa,
-                          BaseFloat lmwt) {
+                          BaseFloat lmwt,
+                          std::string output) {
   if (clat.NumStates() == 0) {
     KALDI_WARN << "Empty lattice.";
     return "";
@@ -323,9 +331,9 @@ std::string LatticeToJson(const CompactLattice &clat,
   Lattice lat;
   ConvertLattice(clat, &lat);
 
-  return LatticeToJson(lat, word_syms, word_boundary, trans_model,
+  return LatticeToOutput(lat, word_syms, word_boundary, trans_model,
                        feature_info, decodable_opts, frame_offset, final,
-                       lm_fst, lm_compose_cache, carpa, lmwt);
+                       lm_fst, lm_compose_cache, carpa, lmwt, output);
 }
 }
 
@@ -363,6 +371,7 @@ int main(int argc, char *argv[]) {
     int read_timeout = 3;
     bool rescore = false;
     BaseFloat lmwt = 1.0;
+    std::string output = "json";
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -380,6 +389,8 @@ int main(int argc, char *argv[]) {
                 "Do we want to rescore lattices with bigger LM?");
     po.Register("lmwt", &lmwt,
                 "Rescoring LM weight.");
+    po.Register("output", &output,
+                "json or text");
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
@@ -506,12 +517,12 @@ int main(int argc, char *argv[]) {
               decoder.GetLattice(true, &lat);
               std::string msg;
               if (rescore)
-                msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+                msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
                                     feature_info, decodable_opts, frame_offset, true,
-                                    g_fst, lm_compose_cache, carpa, lmwt);
+                                    g_fst, lm_compose_cache, carpa, lmwt, output);
               else
-                msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
-                                    feature_info, decodable_opts, frame_offset, true);
+                msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                    feature_info, decodable_opts, frame_offset, true, output);
               if (msg.size() > 0)
                 server.WriteLn(msg);
             } else
@@ -540,11 +551,15 @@ int main(int argc, char *argv[]) {
               Lattice lat;
               decoder.GetBestPath(false, &lat);
               std::string msg;
-              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
                                   feature_info, decodable_opts, 
-                                  frame_offset + decoder.NumFramesDecoded(), false);
-              if (msg.size() > 0)
-                server.WriteLn(msg);
+                                  frame_offset + decoder.NumFramesDecoded(), false, output);
+              if (msg.size() > 0) {
+                if (output == "text")
+                  server.WriteLn(msg, "\r");
+                else
+                  server.WriteLn(msg);
+              }
             }
             check_count += check_period;
           }
@@ -556,12 +571,12 @@ int main(int argc, char *argv[]) {
             decoder.GetLattice(true, &lat);
             std::string msg;
             if (rescore)
-              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
                                   feature_info, decodable_opts, frame_offset, true,
-                                  g_fst, lm_compose_cache, carpa, lmwt);
+                                  g_fst, lm_compose_cache, carpa, lmwt, output);
             else
-              msg = LatticeToJson(lat, *word_syms, *word_boundary, trans_model,
-                                  feature_info, decodable_opts, frame_offset, true);
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, frame_offset, true, output);
             if (msg.size() > 0)
               server.WriteLn(msg);
             break;
