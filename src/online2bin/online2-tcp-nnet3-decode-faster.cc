@@ -29,6 +29,9 @@
 #include "lat/lattice-functions.h"
 #include "util/kaldi-thread.h"
 #include "nnet3/nnet-utils.h"
+#include "lat/word-align-lattice.h"
+#include "lat/sausages.h"
+#include "lm/const-arpa-lm.h"
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -38,6 +41,13 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string>
+
+#include <jansson.h>
+
+/* JSON_REAL_PRECISION is a macro from libjansson 2.7. Ubuntu 12.04 only has 2.2.1-1 */
+#ifndef JSON_REAL_PRECISION
+#define JSON_REAL_PRECISION(n)  (((n) & 0x1F) << 11)
+#endif // JSON_REAL_PRECISION
 
 namespace kaldi {
 
@@ -67,35 +77,263 @@ class TcpServer {
   int read_timeout_;
 };
 
-std::string LatticeToString(const Lattice &lat, const fst::SymbolTable &word_syms) {
+typedef struct _WordAlignmentInfo WordAlignmentInfo;
+
+struct _WordAlignmentInfo {
+  int32 word_id;
+  int32 start_frame;
+  int32 length_in_frames;
+  double confidence;
+};
+
+std::string LatticeToOutput(const Lattice &lat,
+                          const fst::SymbolTable &word_syms,
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          std::string output,
+                          std::vector<BaseFloat> confidences = std::vector<BaseFloat>()) {
   LatticeWeight weight;
   std::vector<int32> alignment;
   std::vector<int32> words;
+  std::vector<WordAlignmentInfo> word_alignment;
+  std::vector<int32> times, lengths;
+
   GetLinearSymbolSequence(lat, &alignment, &words, &weight);
 
-  std::ostringstream msg;
+  // Get the transcript
+  std::ostringstream tr;
   for (size_t i = 0; i < words.size(); i++) {
     std::string s = word_syms.Find(words[i]);
     if (s.empty()) {
       KALDI_WARN << "Word-id " << words[i] << " not in symbol table.";
-      msg << "<#" << std::to_string(i) << "> ";
+      tr << "<#" << std::to_string(i) << "> ";
     } else
-      msg << s << " ";
+      tr << s << " ";
   }
-  return msg.str();
+  std::string transcript = tr.str();
+  size_t end = transcript.find_last_not_of(" \n\r\t\f\v");
+  transcript = (end == std::string::npos) ? "" : transcript.substr(0, end + 1);
+
+  // Break here if we have no words, this skips the segment totally
+  if (transcript.empty())
+    return "";
+
+  if (output == "text") {
+    return transcript;
+  }
+
+  BaseFloat likelihood = -(weight.Value1() + weight.Value2());
+  int num_frames = alignment.size();
+
+  CompactLattice clat;
+  ConvertLattice(lat, &clat);
+  CompactLattice aligned_clat;
+
+  if (confidences.empty()) {
+    // Get confidences
+    MinimumBayesRiskOptions mbr_opts;
+    mbr_opts.decode_mbr = false; // we just want confidences
+    mbr_opts.print_silence = false;
+    MinimumBayesRisk *mbr = new MinimumBayesRisk(clat, words, mbr_opts);
+    confidences = mbr->GetOneBestConfidences();
+    delete mbr;
+  }
+
+  // Word-align the lattice (can be phone-aligned too if needed)
+  if (!WordAlignLattice(clat, trans_model, word_boundary, 0, &aligned_clat)) {
+    KALDI_WARN << "Failed to word-align the lattice";
+    return "";
+  }
+
+  if (!CompactLatticeToWordAlignment(aligned_clat, &words, &times, &lengths)) {
+    KALDI_WARN << "Failed to do word alignment";
+    return "";
+  }
+
+  // Let's assume the vectors are all the same size
+  KALDI_ASSERT(words.size() == times.size() && words.size() == lengths.size());
+
+  // Populate the word_alignment structure
+  int confidence_i = 0;
+  for (size_t i = 0; i < words.size(); i++) {
+    if (words[i] == 0)  {
+      // Don't output anything for <eps> links, which
+      continue; // correspond to silence....
+    }
+    WordAlignmentInfo alignment_info;
+    alignment_info.word_id = words[i];
+    alignment_info.start_frame = times[i];
+    alignment_info.length_in_frames = lengths[i];
+    if (confidences.size() > 0) {
+      alignment_info.confidence = confidences[confidence_i++];
+    }
+    word_alignment.push_back(alignment_info);
+  }
+
+  // Construct the returned json object
+  json_t *root = json_object();
+  json_t *result_json_object = json_object();
+  json_object_set_new(root, "status", json_integer(0));
+  json_object_set_new(root, "result", result_json_object);
+
+  if (final)
+    json_object_set_new(result_json_object, "final", json_true());
+  else
+    json_object_set_new(result_json_object, "final", json_false());
+
+  BaseFloat frame_shift = feature_info.FrameShiftInSeconds();
+  frame_shift *= decodable_opts.frame_subsampling_factor;
+
+  json_object_set_new(root, "segment-start",  json_real((frame_offset - num_frames) * frame_shift));
+  json_object_set_new(root, "segment-length",  json_real(num_frames * frame_shift));
+  json_object_set_new(root, "total-length",  json_real(frame_offset * frame_shift));
+
+  json_t *nbest_json_arr = json_array();
+  json_t *nbest_result_json_object = json_object();
+  json_object_set_new(nbest_result_json_object, "transcript", json_string(transcript.c_str()));
+  json_object_set_new(nbest_result_json_object, "likelihood",  json_real(likelihood));
+  json_array_append(nbest_json_arr, nbest_result_json_object);
+  
+  json_t *word_alignment_json_arr = json_array();
+  for (size_t j = 0; j < word_alignment.size(); j++) {
+    WordAlignmentInfo alignment_info = word_alignment[j];
+    json_t *alignment_info_json_object = json_object();
+    std::string word = word_syms.Find(alignment_info.word_id);
+    json_object_set_new(alignment_info_json_object, "word", json_string(word.c_str()));
+    json_object_set_new(alignment_info_json_object, "start", json_real(alignment_info.start_frame * frame_shift));
+    json_object_set_new(alignment_info_json_object, "length", json_real(alignment_info.length_in_frames * frame_shift));
+    json_object_set_new(alignment_info_json_object, "confidence", json_real(alignment_info.confidence));
+    json_array_append(word_alignment_json_arr, alignment_info_json_object);
+  }
+  json_object_set_new(nbest_result_json_object, "word-alignment", word_alignment_json_arr);
+  json_object_set_new(result_json_object, "hypotheses", nbest_json_arr);
+
+  char *ret_strings = json_dumps(root, JSON_REAL_PRECISION(6));
+  json_decref(root);
+  std::string json;
+  json = ret_strings;
+  return json;
 }
 
-std::string LatticeToString(const CompactLattice &clat, const fst::SymbolTable &word_syms) {
+std::string LatticeToOutput(const CompactLattice &clat,
+                          const fst::SymbolTable &word_syms, 
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          std::string output) {
   if (clat.NumStates() == 0) {
     KALDI_WARN << "Empty lattice.";
     return "";
   }
+
+  // Get confidences
+  MinimumBayesRiskOptions mbr_opts;
+  mbr_opts.decode_mbr = false; // we just want confidences
+  mbr_opts.print_silence = false;
+  MinimumBayesRisk *mbr = new MinimumBayesRisk(clat, mbr_opts);
+  std::vector<BaseFloat> confidences = mbr->GetOneBestConfidences();
+  delete mbr;
+
   CompactLattice best_path_clat;
   CompactLatticeShortestPath(clat, &best_path_clat);
 
   Lattice best_path_lat;
   ConvertLattice(best_path_clat, &best_path_lat);
-  return LatticeToString(best_path_lat, word_syms);
+  return LatticeToOutput(best_path_lat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final, output, confidences);
+}
+
+std::string LatticeToOutput(const Lattice &lat,
+                          const fst::SymbolTable &word_syms,
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
+                          fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
+                          const ConstArpaLm &carpa,
+                          BaseFloat lmwt,
+                          std::string output) {
+  Lattice tmp_lat(lat), composed_lat;
+
+  CompactLattice determinized_lat, composed_clat, res_clat;
+
+  fst::ScaleLattice(fst::GraphLatticeScale(-1.0), &tmp_lat);
+  ArcSort(&tmp_lat, fst::OLabelCompare<LatticeArc>());
+  TableCompose(tmp_lat, lm_fst, &composed_lat, &lm_compose_cache);
+  Invert(&composed_lat); // make it so word labels are on the input.
+  DeterminizeLattice(composed_lat, &determinized_lat);
+  fst::ScaleLattice(fst::GraphLatticeScale(-1.0), &determinized_lat);
+
+  if (determinized_lat.Start() == fst::kNoStateId) {
+    KALDI_WARN << "Empty lattice (incompatible LM?)";
+    return "";
+  } 
+  
+  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &determinized_lat);
+  ArcSort(&determinized_lat, fst::OLabelCompare<CompactLatticeArc>());
+
+  ConstArpaLmDeterministicFst const_arpa_fst(carpa);
+  ComposeCompactLatticeDeterministic(determinized_lat, &const_arpa_fst, &composed_clat);
+  ConvertLattice(composed_clat, &composed_lat);
+  Invert(&composed_lat);
+  DeterminizeLattice(composed_lat, &res_clat);
+  fst::ScaleLattice(fst::GraphLatticeScale(1.0), &res_clat);
+
+  if (res_clat.Start() == fst::kNoStateId) {
+    KALDI_WARN << "Empty lattice (incompatible LM?)";
+    return "";
+  }
+
+  if (lmwt != 1.0) {
+    BaseFloat acoustic_scale = 1.0 / lmwt;
+    fst::ScaleLattice(fst::AcousticLatticeScale(acoustic_scale), &res_clat);
+
+    if (!PruneLattice(5.0, &res_clat)) {
+      KALDI_WARN << "Error pruning lattice";
+      return "";
+    }
+
+    fst::ScaleLattice(fst::AcousticLatticeScale(1.0/acoustic_scale), &res_clat);
+  }
+
+  return LatticeToOutput(res_clat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final, output);
+}
+
+std::string LatticeToOutput(const CompactLattice &clat,
+                          const fst::SymbolTable &word_syms, 
+                          const WordBoundaryInfo &word_boundary,
+                          const TransitionModel &trans_model,
+                          const OnlineNnet2FeaturePipelineInfo &feature_info,
+                          const nnet3::NnetSimpleLoopedComputationOptions &decodable_opts,
+                          int32 frame_offset,
+                          bool final,
+                          const fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > &lm_fst,
+                          fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache,
+                          const ConstArpaLm &carpa,
+                          BaseFloat lmwt,
+                          std::string output) {
+  if (clat.NumStates() == 0) {
+    KALDI_WARN << "Empty lattice.";
+    return "";
+  }
+
+  Lattice lat;
+  ConvertLattice(clat, &lat);
+
+  return LatticeToOutput(lat, word_syms, word_boundary, trans_model,
+                       feature_info, decodable_opts, frame_offset, final,
+                       lm_fst, lm_compose_cache, carpa, lmwt, output);
 }
 }
 
@@ -114,8 +352,7 @@ int main(int argc, char *argv[]) {
         "Note: some configuration values and inputs are set via config\n"
         "files whose filenames are passed as options\n"
         "\n"
-        "Usage: online2-tcp-nnet3-decode-faster [options] <nnet3-in> "
-        "<fst-in> <word-symbol-table>\n";
+        "Usage: online2-tcp-nnet3-decode-faster [options] <model-dir>\n";
 
     ParseOptions po(usage);
 
@@ -132,6 +369,9 @@ int main(int argc, char *argv[]) {
     BaseFloat samp_freq = 16000.0;
     int port_num = 5050;
     int read_timeout = 3;
+    bool rescore = false;
+    BaseFloat lmwt = 1.0;
+    std::string output = "json";
 
     po.Register("samp-freq", &samp_freq,
                 "Sampling frequency of the input signal (coded as 16-bit slinear).");
@@ -145,6 +385,12 @@ int main(int argc, char *argv[]) {
                 "Number of seconds of timout for TCP audio data to appear on the stream. Use -1 for blocking.");
     po.Register("port-num", &port_num,
                 "Port number the server will listen on.");
+    po.Register("rescore", &rescore,
+                "Do we want to rescore lattices with bigger LM?");
+    po.Register("lmwt", &lmwt,
+                "Rescoring LM weight.");
+    po.Register("output", &output,
+                "json or text");
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
@@ -153,14 +399,18 @@ int main(int argc, char *argv[]) {
 
     po.Read(argc, argv);
 
-    if (po.NumArgs() != 3) {
+    if (po.NumArgs() != 1) {
       po.PrintUsage();
       return 1;
     }
 
-    std::string nnet3_rxfilename = po.GetArg(1),
-        fst_rxfilename = po.GetArg(2),
-        word_syms_filename = po.GetArg(3);
+    std::string model_dir = po.GetArg(1);
+    std::string nnet3_rxfilename = model_dir + "/final.mdl";
+    std::string fst_rxfilename = model_dir + "/HCLG.fst.map";
+    std::string word_syms_filename = model_dir + "/words.txt";
+    std::string word_boundary_filename = model_dir + "/phones/word_boundary.int";
+    std::string g_fst_filename = model_dir + "/G.fst.proj.sort";
+    std::string g_carpa_filename = model_dir + "/G.carpa";
 
     OnlineNnet2FeaturePipelineInfo feature_info(feature_opts);
 
@@ -193,6 +443,33 @@ int main(int argc, char *argv[]) {
       if (!(word_syms = fst::SymbolTable::ReadText(word_syms_filename)))
         KALDI_ERR << "Could not read symbol table from file "
                   << word_syms_filename;
+
+    WordBoundaryInfoNewOpts opts;
+    WordBoundaryInfo *word_boundary = new WordBoundaryInfo(opts, word_boundary_filename);
+
+    KALDI_VLOG(1) << "Loading G.fst...";
+
+    fst::VectorFst<fst::StdArc> *lm_fst = fst::VectorFst<fst::StdArc>::Read(g_fst_filename);
+    if (lm_fst->Properties(fst::kILabelSorted, true) == 0) {
+      // Make sure LM is sorted on ilabel.
+      fst::ILabelCompare<fst::StdArc> ilabel_comp;
+      fst::ArcSort(lm_fst, ilabel_comp);
+    }
+    int32 num_states_cache = 50000;
+    fst::CacheOptions cache_opts(true, num_states_cache);
+    fst::MapFstOptions mapfst_opts(cache_opts);
+    fst::StdToLatticeMapper<BaseFloat> mapper;
+    fst::MapFst<fst::StdArc, LatticeArc, fst::StdToLatticeMapper<BaseFloat> > g_fst(*lm_fst, mapper, mapfst_opts);
+    delete lm_fst;
+    fst::TableComposeOptions compose_opts(fst::TableMatcherOptions(),
+                                          true, fst::SEQUENCE_FILTER,
+                                          fst::MATCH_INPUT);
+    fst::TableComposeCache<fst::Fst<LatticeArc> > lm_compose_cache(compose_opts);
+
+    KALDI_VLOG(1) << "Loading G.carpa...";
+
+    ConstArpaLm carpa;
+    ReadKaldiObject(g_carpa_filename, &carpa);
 
     signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE to avoid crashing when socket forcefully disconnected
 
@@ -238,8 +515,16 @@ int main(int argc, char *argv[]) {
             if (decoder.NumFramesDecoded() > 0) {
               CompactLattice lat;
               decoder.GetLattice(true, &lat);
-              std::string msg = LatticeToString(lat, *word_syms);
-              server.WriteLn(msg);
+              std::string msg;
+              if (rescore)
+                msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                    feature_info, decodable_opts, frame_offset, true,
+                                    g_fst, lm_compose_cache, carpa, lmwt, output);
+              else
+                msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                    feature_info, decodable_opts, frame_offset, true, output);
+              if (msg.size() > 0)
+                server.WriteLn(msg);
             } else
               server.Write("\n");
             server.Disconnect();
@@ -265,8 +550,16 @@ int main(int argc, char *argv[]) {
             if (decoder.NumFramesDecoded() > 0) {
               Lattice lat;
               decoder.GetBestPath(false, &lat);
-              std::string msg = LatticeToString(lat, *word_syms);
-              server.WriteLn(msg, "\r");
+              std::string msg;
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, 
+                                  frame_offset + decoder.NumFramesDecoded(), false, output);
+              if (msg.size() > 0) {
+                if (output == "text")
+                  server.WriteLn(msg, "\r");
+                else
+                  server.WriteLn(msg);
+              }
             }
             check_count += check_period;
           }
@@ -276,8 +569,16 @@ int main(int argc, char *argv[]) {
             frame_offset += decoder.NumFramesDecoded();
             CompactLattice lat;
             decoder.GetLattice(true, &lat);
-            std::string msg = LatticeToString(lat, *word_syms);
-            server.WriteLn(msg);
+            std::string msg;
+            if (rescore)
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, frame_offset, true,
+                                  g_fst, lm_compose_cache, carpa, lmwt, output);
+            else
+              msg = LatticeToOutput(lat, *word_syms, *word_boundary, trans_model,
+                                  feature_info, decodable_opts, frame_offset, true, output);
+            if (msg.size() > 0)
+              server.WriteLn(msg);
             break;
           }
         }
